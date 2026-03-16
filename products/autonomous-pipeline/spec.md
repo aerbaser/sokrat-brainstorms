@@ -6,16 +6,33 @@
 
 ## Context
 
-**Система:** 5 агентов на VPS через OpenClaw:
-- **Сократ** — координатор, event dispatcher
-- **Архимед** — dev-оркестратор, управляет ACP сессиями
-- **Аристотель** — research, анализ
-- **Платон** — brainstorm, spec generation
-- **Геродот** — reporting
+**Система Платона** (Docker, отдельный OpenClaw instance):
 
-**Инфраструктура:** GitHub (aerbaser), Docker, Codex/Claude Code как ACP coding agents, CI/CD через GitHub Actions, один VPS.
+| ID | Эмодзи | Модель | Роль |
+|----|--------|--------|------|
+| `main` (Платон) | 🏛️ | Sonnet | Координатор, event dispatcher, spec reviewer |
+| `brainstorm` | 🧠 | Opus/Codex | Brainstorm, spec generation |
+| `architect` | 🏗 | Sonnet | Triage, планы, GitHub issues, decomposition |
+| `ops` | ⚙️ | Sonnet | AO мониторинг, CI setup, deploy, health |
 
-**Существующие скиллы:** brainstorming, superpowers, ci-architect, issue-architect, plan-to-issues, coding agents.
+**Coding agents:** ACP сессии (Codex/Claude Code) — спавнятся через AO (Agent Orchestrator)
+
+**Инфраструктура:** GitHub (aerbaser), Docker, AO, CI/CD через GitHub Actions, VPS.
+
+**Существующие скиллы:**
+- `brainstorming` — Q&A → spec
+- `issue-architect` — идеальные AO-ready issues
+- `plan-to-issues` — декомпозиция плана на пакеты
+- `ci-architect` — генерация CI DAG
+- `ao-ops` — управление Agent Orchestrator
+- `ci-forensics` — диагностика CI failures
+
+**Группа Telegram:** `-1003822323654`
+- topic:3 — Codex Brainstorm
+- topic:4 — Claude Brainstorm
+- topic:6 — Results
+- topic:7 — Ops
+- topic:10 — Architect
 
 ## Design Decisions
 
@@ -24,8 +41,8 @@
 | Уровень автономности | Supervised auto, 30-мин auto-continue | Человек видит прогресс, может вмешаться, но не блокирует |
 | Primary product type | Web apps (80%), CLI + skills как extensions | Покрывает основной кейс, расширяемо |
 | Источник идей | GitHub Issues backlog + AI-генерация (v2) | v1 — ручной backlog, AI idea gen — v2 |
-| AI↔AI brainstorm | Research-first: Аристотель → Платон → Сократ-review | Решения на данных, не фантазиях |
-| Оркестрация | Параллельный оркестратор (Архимед), 2-3 issues | Скорость важнее простоты |
+| AI↔AI brainstorm | Research-first: Brainstorm + web_search → Платон-review | Решения на данных, не фантазиях |
+| Оркестрация | AO (Agent Orchestrator) через Ops | AO уже есть, параллельные ACP сессии |
 | Тестирование | Гибрид: dev = unit (TDD), QA = integration + E2E | Два уровня защиты |
 | UI тесты | Playwright primary, Agent Browser fallback | Стабильность, CI-friendly |
 | Delivery | Auto-deploy staging, manual prod trigger | Безопасность production |
@@ -38,39 +55,52 @@
 ### Pipeline — 9 фаз, связанных через GitHub events
 
 ```
-┌─────────────┐   label:approved   ┌───────────┐   research:done   ┌──────────────┐
-│  1. IDEATE  │ ─────────────────▶ │ 2. RESEARCH│ ────────────────▶│ 3. BRAINSTORM │
-│  (Backlog)  │                    │(Аристотель)│                  │   (Платон)    │
-└─────────────┘                    └───────────┘                   └──────┬───────┘
-                                                                         │ spec:ready
-┌─────────────┐   issues:ready     ┌────────────┐                  ┌────▼────────┐
-│ 5. DEVELOP  │ ◀──────────────── │ 4. DECOMPOSE│ ◀──────────────│  Сократ      │
-│  (Архимед)  │                    │(Spec→Issues)│   spec:approved │  (Review)    │
-└──────┬──────┘                    └────────────┘                  └─────────────┘
+┌─────────────┐   label:approved   ┌─────────────┐   research:done   ┌──────────────┐
+│  1. IDEATE  │ ─────────────────▶ │ 2. RESEARCH │ ────────────────▶│ 3. BRAINSTORM │
+│  (Backlog)  │                    │ (Brainstorm │                  │  (Brainstorm  │
+│             │                    │  web_search)│                  │   + spec)     │
+└─────────────┘                    └─────────────┘                  └──────┬───────┘
+                                                                          │ spec:ready
+┌─────────────┐   issues:ready     ┌────────────┐                  ┌─────▼────────┐
+│ 5. DEVELOP  │ ◀──────────────── │ 4. DECOMPOSE│ ◀──────────────│  Платон       │
+│ (AO + ACP)  │                    │ (Architect) │   spec:approved │  (Review)     │
+└──────┬──────┘                    └────────────┘                  └──────────────┘
        │ pr:ready
 ┌──────▼──────┐   tests:pass      ┌───────────┐   review:pass    ┌─────────────┐
 │  6. TEST    │ ─────────────────▶│ 7. REVIEW  │ ───────────────▶│  8. DEPLOY  │
-│ (QA Agent)  │                    │(AI Review) │                  │  (Staging)  │
+│  (CI + E2E) │                    │(AI Review) │                  │   (Ops)     │
 └─────────────┘                    └───────────┘                  └──────┬──────┘
                                                                          │ deploy:done
                                                                   ┌─────▼───────┐
                                                                   │  9. RETRO   │
-                                                                  │ (Feedback)  │
+                                                                  │  (Платон)   │
                                                                   └─────────────┘
 ```
 
 ### Event Bus = GitHub Labels + Comments + PR status
 
 - Каждая фаза меняет label на issue/PR → следующий агент реагирует
-- Сократ — event dispatcher: мониторит GitHub events, роутит на нужного агента
+- **Платон (main)** — event dispatcher: мониторит GitHub events, роутит на нужного агента
 - Состояние pipeline = набор labels на GitHub issue (single source of truth)
-- 30-мин auto-continue: если human notification отправлено и нет ответа — продолжаем
+- 30-мин auto-continue: если human notification отправлено и нет ответа → продолжаем
+
+### Agent Responsibility Map
+
+| Агент | Фазы | Навыки |
+|-------|-------|--------|
+| **Платон** | Event dispatch, Phase 4 review, Phase 9 retro | Координация, sessions_spawn |
+| **Brainstorm** | Phase 2 (research), Phase 3 (spec) | brainstorming, web_search |
+| **Architect** | Phase 4 (decompose → issues) | issue-architect, plan-to-issues, ci-architect |
+| **Ops** | Phase 5 (AO management), Phase 6 (CI), Phase 8 (deploy) | ao-ops, ci-forensics, ci-architect |
+| **ACP sessions** | Phase 5 (coding), Phase 6 (unit tests) | Codex/Claude Code через AO |
 
 ### Notification Layer
 
 - Каждый переход между фазами → уведомление в Telegram
-- Topic:3 (Brainstorm) — для фаз 1-4
-- Topic:6 (Results) — для фаз 5-9
+- topic:4 — для фаз 2-3 (brainstorm)
+- topic:10 — для фазы 4 (issues)
+- topic:7 — для фаз 5-6, 8 (dev/CI/deploy)
+- topic:6 — для финальных результатов (7-9)
 - Человек может написать "стоп" в любой момент → pipeline paused
 
 ---
@@ -79,11 +109,12 @@
 
 ### Phase 1 — IDEATE (Backlog Manager)
 
-**Где:** GitHub Issues в repo `sokrat-core` с label `idea`
+**Агент:** Платон (main)
+**Где:** GitHub Issues в project repo с label `idea`
 
 **Input:**
 - Человек создаёт issue с label `idea`
-- (v2) Агент создаёт issue с label `idea:ai-generated`
+- (v2) Brainstorm агент генерирует идеи и создаёт issue с label `idea:ai-generated`
 
 **Scoring:**
 - Каждая идея: `impact` (1-5) × `feasibility` (1-5) = score
@@ -95,519 +126,445 @@
 - Pipeline берёт approved с наивысшим score
 - Одновременно один проект в pipeline (очередь для остальных)
 
-### Phase 2 — RESEARCH (Аристотель)
+### Phase 2 — RESEARCH (Brainstorm agent)
 
+**Агент:** Brainstorm (🧠)
 **Trigger:** Issue получает label `pipeline:research`
 
-**Действия:**
-1. Web search конкурентов и аналогов
-2. Анализ best practices для выбранного tech stack
-3. Сбор технических ограничений
-4. Компиляция результатов в `research.md`
+**Процесс:**
+1. Платон спавнит Brainstorm с задачей research
+2. Brainstorm использует `web_search` + `web_fetch` для сбора данных:
+   - Аналоги на рынке
+   - Технические подходы
+   - Best practices
+3. Результат → `research.md` в комментарий к GitHub issue
+4. Label → `pipeline:research-done`
 
-**Output:**
-- Комментарий на issue с research summary
-- Файл `research.md` в repo
-- Label `pipeline:research-done`
+**Output:** Markdown с секциями:
+- Рынок/аналоги (3-5 ключевых)
+- Технические подходы (с trade-offs)
+- Рекомендация
+- Источники (URLs)
 
-**Время:** 10-20 минут
+**Timeout:** 15 мин. Если Brainstorm не отвечает → Платон пинг → 5 мин → skip research, продолжить brainstorm с тем что есть.
 
-### Phase 3 — BRAINSTORM (Платон)
+### Phase 3 — BRAINSTORM (Brainstorm agent)
 
+**Агент:** Brainstorm (🧠)
 **Trigger:** Label `pipeline:brainstorm`
+**Skill:** `brainstorming` (SKILL.md)
 
-**Input:** Текст issue + research.md от Аристотеля
+**AI↔AI Brainstorm:**
+1. Платон формирует промпт на основе issue + research.md
+2. Brainstorm запускает полный brainstorming flow (skill):
+   - Phase 1: контекст из repo
+   - Phase 2: вопросы → **Платон отвечает** (AI↔AI, sessions_send)
+   - Phase 3: подходы
+   - Phase 4: дизайн по секциям → Платон approve
+   - Phase 5: spec.md → commit → push в `sokrat-brainstorms`
+3. Brainstorm отправляет ссылку на spec.md в topic:6
 
-**Действия:**
-1. Self-brainstorm на основе собранных данных
-2. Платон отвечает на вопросы brainstorming skill, используя research как факты
-3. Генерит spec.md через стандартный процесс (architecture → components → data flow → error handling → testing → scope)
+**Критично:** Платон отвечает на вопросы Brainstorm агента как прокси-пользователь, используя research data + контекст проекта. Если уверенность < 50% → эскалация к человеку.
 
-**Output:**
-- `spec.md` в `sokrat-brainstorms/products/<name>/spec.md`
-- Label `pipeline:spec-ready`
+**Output:** `spec.md` в `sokrat-brainstorms/products/<name>/spec.md`
 
-**Время:** 15-30 минут
+### Phase 4 — SPEC REVIEW + DECOMPOSE
 
-### Phase 4 — SPEC REVIEW + DECOMPOSE (Сократ + Архитектор)
+**Агенты:** Платон (review) → Architect (decompose)
 
-**Trigger:** Label `pipeline:spec-review`
+**4a — Review (Платон):**
+- Читает spec.md
+- Проверяет: полнота, реализуемость, YAGNI
+- Если проблемы → возвращает Brainstorm с комментариями
+- Если ОК → label `pipeline:spec-approved`
+- Уведомление в topic:6: "Spec approved. Начинаю decompose."
+- 30-мин window: человек может вмешаться
 
-**4a — Review (Сократ):**
-- Ревьюит spec через subagent-reviewer (Phase 6 brainstorming skill)
-- Max 5 итераций review loop
-- Approve → label `pipeline:spec-approved`
-- Notification человеку → 30 мин auto-continue
+**4b — Decompose (Architect):**
+**Skill:** `issue-architect` + `plan-to-issues`
 
-**4b — Decompose (после approve):**
-- Парсит spec.md → извлекает компоненты, endpoints, UI pages
-- Создаёт GitHub issues (один issue = один branch = один PR)
+1. Architect читает spec.md
+2. Создаёт GitHub issues:
+   - Каждый issue = один branch = один PR
+   - Labels: `ao-ready`, `priority:N`, `phase:N`
+   - Acceptance criteria = конкретные проверки
+   - Dependencies: `depends-on: #XX`
+3. Создаёт milestone на GitHub
+4. Если > 10 файлов в issue → разбивает на sub-issues
+5. Label → `pipeline:issues-ready`
 
-**Формат каждого issue:**
+**Issue format (AO-ready):**
 ```markdown
-## Title
-[Конкретная задача]
+## Context
+[Ссылка на spec, что реализуем]
+
+## Task
+[Конкретные файлы, функции, endpoints]
 
 ## Acceptance Criteria
-- [ ] Criterion 1
-- [ ] Criterion 2
-- [ ] Criterion 3
-
-## Technical Notes
-[Из spec — что конкретно делать]
+- [ ] Unit tests pass
+- [ ] Endpoint returns 200
+- [ ] Integration test added
 
 ## Dependencies
-Blocked by: #N (если есть)
+depends-on: #XX (если есть)
 ```
 
-**Labels:** `priority:high/med/low`, `type:frontend/backend/infra/test`
-**Milestone:** `<project-name> v1`
-**Dependency links:** `Blocked by #N` в body
+### Phase 5 — DEVELOP (AO + ACP sessions)
 
-**Output:** N issues созданы, label `pipeline:issues-ready`
+**Агенты:** Ops (AO management) → ACP sessions (Codex/Claude Code)
+**Trigger:** Label `pipeline:issues-ready` на milestone
 
-### Phase 5 — DEVELOP (Архимед → ACP sessions)
+**Ops запускает AO:**
+1. `ao start` для проекта
+2. `ao lifecycle-worker <project> --interval-ms 30000`
+3. AO берёт issues с label `ao-ready` и спавнит ACP сессии
 
-**Trigger:** Label `pipeline:dev`
+**AO как оркестратор:**
+- Смотрит dependency graph
+- Параллельно: 2-3 independent issues одновременно
+- Последовательно: dependent issues ждут completion
+- Для каждого issue: branch → code → tests → PR
 
-**Архимед как оркестратор:**
-1. Берёт issues из milestone, строит dependency graph
-2. Спавнит 2-3 ACP сессии параллельно (только issues без блокирующих зависимостей)
-3. Мониторит прогресс каждой сессии
+**Coding flow (per issue):**
+1. AO спавнит ACP сессию (Codex или Claude Code)
+2. ACP читает issue, пишет код + unit тесты (TDD)
+3. `git push` → PR создаётся
+4. CI запускается автоматически
+5. Если CI fail → AO re-спавнит ACP на fix
 
-**Каждая ACP сессия:**
-- Создаёт branch от main: `feat/<issue-number>-<short-name>`
-- Пишет код + unit тесты (TDD style)
-- Создаёт PR с описанием (что сделано, acceptance criteria checklist)
-- CI запускается автоматически
+**Branch strategy:**
+- `main` — protected, only merge via PR
+- `ao/<issue-number>-<short-name>` — рабочие ветки
+- Squash merge после approve
 
-**Merge strategy:**
-- Каждый PR проходит CI (lint + typecheck + unit tests)
-- Архимед мержит PR в main (squash merge)
-- Перед merge — rebase на latest main
-- При conflict: auto-resolve если trivial, sequential merge если complex
+**Merge:**
+- AO автоматически мержит PR если CI pass + no conflicts
+- При конфликтах → AO спавнит ACP на resolve
 
-**Branch naming:** `feat/<issue-number>-<short-description>`
-**Commit format:** `feat(#N): description` / `fix(#N): description` / `test(#N): description`
+**Мониторинг:**
+- Ops отслеживает через `ao status`, `ao session ls`
+- Timeout: 30 мин на issue. Если ACP завис → Ops убивает сессию, переспавнивает
+- Статус в topic:7
 
-### Phase 6 — TEST (QA Agent)
+### Phase 6 — TEST (CI + E2E)
 
-**Trigger:** Все dev issues в milestone merged → label `pipeline:test`
+**Агенты:** Ops (CI monitoring) + ACP sessions (E2E тесты)
+**Trigger:** Все PRs merged → label `pipeline:test`
 
-**QA Agent — отдельная ACP сессия:**
+**Три уровня тестирования:**
 
-**Level 2 — Integration тесты:**
-1. Читает spec.md + исходный код
-2. Пишет integration test suite:
-   - API endpoints (request → response, status codes, validation)
-   - Database operations (CRUD, constraints)
-   - Service interactions (auth → API → DB flow)
-3. Framework: Supertest (Node) / httpx (Python), testcontainers для DB
+**Level 1 — Unit (уже в Phase 5):**
+- Каждый ACP пишет unit тесты вместе с кодом (TDD)
+- CI запускает: `bun test` / `npm test`
+- Coverage threshold: 70%
 
-**Level 3 — E2E тесты (Playwright):**
-1. Извлекает user stories из spec
-2. Пишет Playwright тесты:
-   - Critical user flows (CRUD operations)
-   - Формы: валидация, submit, error states
-   - Навигация: все роуты, 404
-   - Responsive: desktop (1280px) + mobile (375px)
-3. Setup: Docker compose (app + DB) + headless Chromium
+**Level 2 — Integration:**
+- Ops спавнит ACP сессию для integration тестов
+- Тестирует: API endpoints, data flow между компонентами
+- Framework: тот же что unit (Vitest/Jest), но с реальными dependencies
 
-**Test failure loop:**
-```
-Tests fail
-    │
-    ▼
-QA Agent анализирует → создаёт bug issue:
-    - Failing test name
-    - Error message
-    - Expected vs actual
-    - Suggested fix area
-    │
-    ▼
-Архимед назначает на ACP сессию → fix → push → re-test
-    │
-    ├─ pass → pipeline continues
-    └─ fail → iterate (max 3, потом escalate)
-```
+**Level 3 — E2E / UI (для web apps):**
+- **Tool:** Playwright (primary)
+- Ops спавнит ACP сессию для E2E:
+  1. ACP читает spec → пишет Playwright тесты
+  2. Тестирует: навигация, формы, кнопки, flows
+  3. Visual snapshots для regression
+- **Fallback:** Agent Browser tool для интерактивной проверки
+- CI запускает: `npx playwright test`
 
-**Output:** Test report в PR comment, label `pipeline:tests-pass`
+**Если тесты падают:**
+1. Ops анализирует лог (skill: `ci-forensics`)
+2. Создаёт fix issue с label `bug` + `ao-ready`
+3. AO спавнит ACP на fix
+4. Re-run тестов
+5. Max 3 retry. Если после 3 fail → эскалация к человеку
 
-### Phase 7 — CODE REVIEW (AI Reviewer)
+**Output:** Test report в комментарии к milestone issue
 
+### Phase 7 — CODE REVIEW (AI Review)
+
+**Агент:** Платон (main) спавнит review subagent
 **Trigger:** Label `pipeline:review`
 
-**Кто:** Отдельная ACP сессия с review-specific prompt ("свежие глаза")
+**Процесс:**
+1. Платон спавнит subagent с задачей code review
+2. Subagent проверяет:
+   - Соответствие spec
+   - Code quality, naming, structure
+   - Security issues (SQL injection, XSS, secrets)
+   - Performance (N+1, unnecessary re-renders)
+   - Test coverage
+3. Результат:
+   - ✅ Approved → label `pipeline:review-pass`
+   - ❌ Issues → GitHub review comments → fix issues → retry
+4. Max 3 review rounds. После 3 → эскалация.
 
-**Checklist:**
-- [ ] Code quality: naming, structure, DRY
-- [ ] Security: injection, auth, secrets exposure
-- [ ] Архитектурное соответствие spec.md
-- [ ] Edge cases: null handling, error states, boundary conditions
-- [ ] Performance: N+1 queries, unnecessary re-renders, large payloads
-- [ ] Test quality: meaningful assertions, edge case coverage
-
-**Output:**
-- Approve → label `pipeline:review-pass`
-- Request changes → comments на PR, конкретные fix tasks → назад в Phase 5
-- Max 2 review rounds, потом escalate
-
-### Phase 8 — DEPLOY (Staging)
-
-**Trigger:** Label `pipeline:deploy`
-
-**Steps:**
-1. Docker build (multi-stage, production config)
-2. Push image to registry (GitHub Container Registry)
-3. Deploy на staging VPS (docker-compose up)
-4. Smoke test: health check endpoint + basic page load
-5. Генерация changelog (из PR descriptions)
-
-**Output:**
-- Staging URL отправляется в Telegram (topic:6)
-- Changelog в Telegram
-- Label `pipeline:deployed`
-
-**Production deploy:**
-- Только ручной trigger
-- Человек пишет "деплой в прод" или через GitHub Actions manual dispatch
-- Same Docker image что на staging (promote, не rebuild)
-
-### Phase 9 — RETRO (Feedback Loop)
-
-**Trigger:** Label `pipeline:retro` (после успешного deploy)
-
-**Метрики собираются автоматически:**
-
-| Метрика | Как считается |
-|---------|---------------|
-| Total time | Время от `pipeline:research` до `pipeline:deployed` |
-| Time per phase | Timestamps на каждом label change |
-| CI fail count | Кол-во failed CI runs |
-| Review iterations | Кол-во review rounds |
-| Bug issues created | Issues с label `bug:auto` |
-| Test coverage | Coverage report из CI |
-| Lines of code | `git diff --stat` main..before vs after |
-
-**Retro report:**
-```markdown
-# 🔄 Retro: [Project Name]
-
-## Метрики
-- Общее время: X часов
-- Фазы: Research 15m, Brainstorm 25m, Dev 3h, Test 45m, Review 20m, Deploy 10m
-- CI fails: N
-- Bugs found in testing: N
-- Review iterations: N
-- Test coverage: N%
-
-## Что пошло хорошо
-- [автоматически: фазы без retries]
-
-## Что можно улучшить
-- [автоматически: фазы с retries, длинные фазы]
-
-## Learnings
-- [конкретные паттерны для запоминания]
+**Review checklist:**
+```
+□ Spec compliance — все requirements из spec реализованы
+□ No dead code — нет unused imports/functions
+□ Error handling — все async operations wrapped
+□ Security — no secrets, no injection vectors
+□ Tests — coverage adequate, meaningful assertions
+□ Performance — no obvious N+1, unnecessary loops
 ```
 
-**Куда идёт:**
-- Retro report → Telegram (topic:6)
-- Learnings → memory файлы (для self-improvement skill)
-- Metrics → `metrics.json` (накопительно, для трендов)
-- Label `pipeline:done`
+### Phase 8 — DEPLOY (Ops)
+
+**Агент:** Ops (⚙️)
+**Trigger:** Label `pipeline:deploy`
+
+**Staging auto-deploy:**
+1. Ops настраивает deployment:
+   - Docker build → local container
+   - Cloudflare tunnel для доступа
+   - `.env` из secrets
+2. Запускает staging
+3. Smoke test (curl endpoints, basic health)
+4. Уведомление в topic:6: "Staging ready: [URL]"
+
+**Production:**
+- Manual trigger только (человек пишет "деплой в прод")
+- Ops выполняет production deploy
+
+**Rollback:**
+- Если staging smoke fail → auto-rollback
+- Production rollback → manual trigger
+
+### Phase 9 — RETRO (Платон)
+
+**Агент:** Платон (main)
+**Trigger:** Deploy done → label `pipeline:retro`
+
+**Формальная ретроспектива:**
+1. Платон собирает метрики:
+   - Общее время pipeline (час/дни)
+   - Количество issues / PRs / re-tries
+   - Test pass rate (first attempt)
+   - Review rounds
+   - Human interventions (сколько раз человек вмешался)
+2. Анализ:
+   - Что сработало хорошо
+   - Что затормозило pipeline
+   - Какие фазы нужно улучшить
+3. Output:
+   - `retro.md` в `sokrat-brainstorms/products/<name>/`
+   - Learnings → memory файлы Платона
+   - Метрики → `metrics.json`
+
+**Feedback loop:**
+- Learnings из ретро влияют на следующий pipeline:
+  - Улучшенные промпты для brainstorm
+  - Обновлённые шаблоны issues
+  - Новые checklist items для review
 
 ---
 
 ## 3. Data Flow
 
-### Три слоя данных:
+### Артефакты по фазам
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    GITHUB (Source of Truth)               │
-│                                                           │
-│  Issues          PRs            Files           Labels    │
-│  ┌──────┐       ┌──────┐      ┌──────────┐    ┌───────┐ │
-│  │idea  │──────▶│code  │─────▶│spec.md   │    │pipeline│ │
-│  │body  │       │diff  │      │research.md│   │:phase  │ │
-│  │score │       │tests │      │retro.md  │    │:status │ │
-│  └──────┘       └──────┘      └──────────┘    └───────┘ │
-└──────────────────────┬──────────────────────────────────┘
-                       │ events (label change, PR merge, comment)
-┌──────────────────────▼──────────────────────────────────┐
-│                 СОКРАТ (Event Dispatcher)                 │
-│                                                           │
-│  Monitor loop:                                            │
-│  1. Poll GitHub events (каждые 2 мин)                    │
-│  2. Match event → pipeline phase                          │
-│  3. Dispatch to agent via sessions_spawn                  │
-│  4. Track active sessions + timeouts                      │
-│  5. Handle 30-min auto-continue                           │
-│                                                           │
-│  State tracking:                                          │
-│  ┌─────────────────────────────────────┐                 │
-│  │ pipeline-state.json (per project)   │                 │
-│  │ { phase, started_at, agent,         │                 │
-│  │   issues[], notified_at, human_ack }│                 │
-│  └─────────────────────────────────────┘                 │
-└──────────────────────┬──────────────────────────────────┘
-                       │ sessions_spawn / sessions_send
-┌──────────────────────▼──────────────────────────────────┐
-│                    АГЕНТЫ (Workers)                       │
-│                                                           │
-│  Аристотель ──▶ research.md (→ issue comment)            │
-│  Платон     ──▶ spec.md (→ sokrat-brainstorms repo)      │
-│  Архимед    ──▶ code + tests (→ PR на project repo)      │
-│  QA Agent   ──▶ test report (→ PR comment)               │
-│  Reviewer   ──▶ review (→ PR review)                     │
-│  Deployer   ──▶ staging URL (→ Telegram)                 │
-└─────────────────────────────────────────────────────────┘
+Phase 1 (Ideate)     → GitHub Issue с label `idea:approved`
+Phase 2 (Research)   → research.md (комментарий к issue)
+Phase 3 (Brainstorm) → spec.md (sokrat-brainstorms repo)
+Phase 4 (Decompose)  → GitHub Issues с labels `ao-ready`
+Phase 5 (Develop)    → Code + PRs в project repo
+Phase 6 (Test)       → Test reports (CI artifacts + comments)
+Phase 7 (Review)     → Review comments на PRs
+Phase 8 (Deploy)     → Running staging + URL
+Phase 9 (Retro)      → retro.md + metrics.json
 ```
 
-### Артефакты
+### Кто что создаёт
 
-| Артефакт | Где | Формат |
-|----------|-----|--------|
-| Идея | GitHub Issue body | Markdown |
-| Score | Issue comment | `impact:N feasibility:N score:N` |
-| Research | Issue comment + `research.md` | Markdown |
-| Spec | `sokrat-brainstorms/products/<name>/spec.md` | Markdown |
-| Decomposed issues | GitHub Issues (milestone) | Standard GH format |
-| Code | PR на project repo | Branch per issue |
-| Test report | PR comment + CI artifacts | Markdown + JSON |
-| Review | PR review | GH review comments |
-| Deploy log | Telegram + `deploy.log` | Text |
-| Changelog | Telegram + `CHANGELOG.md` | Markdown |
-| Retro | Telegram + `retro.md` + memory | Markdown + JSON |
-| Metrics | `metrics.json` | JSON (cumulative) |
-
-### Пример flow для одного проекта:
-
-1. Issue `#42 "Task manager app"` — label `idea:approved`, score 20
-2. Сократ видит → `pipeline:research` → спавнит Аристотеля
-3. Аристотель: research.md → комментарий на #42 → `pipeline:research-done`
-4. Сократ → `pipeline:brainstorm` → спавнит Платона
-5. Платон: issue + research → spec.md → push в `sokrat-brainstorms` → `pipeline:spec-ready`
-6. Сократ → уведомление → 30 мин → auto-continue → `pipeline:decompose`
-7. Декомпозиция: spec → issues #43, #44, #45 (milestone "task-manager-v1")
-8. Архимед: #43 + #44 параллельно (нет зависимостей), #45 ждёт (#43 dependency)
-9. PR #43 merged → Архимед стартует #45. PR #44 merged.
-10. Все issues closed → `pipeline:test` → QA agent: integration + E2E → pass
-11. `pipeline:review` → AI review → approve
-12. `pipeline:deploy` → Docker build → staging → ссылка в Telegram
-13. `pipeline:retro` → метрики + learnings → `pipeline:done`
+```
+┌─────────────────────────────────────────────────────┐
+│  Brainstorm  ──▶ research.md + spec.md              │
+│  Architect   ──▶ GitHub issues (AO-ready)           │
+│  Ops + AO    ──▶ code + tests (→ PR на project repo)│
+│  Ops         ──▶ CI config + staging deploy         │
+│  Платон      ──▶ review + retro + coordination      │
+└─────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 4. Error Handling
+## 4. End-to-End Example
 
-### 4.1 — Типы ошибок и реакция
-
-| Фаза | Что может сломаться | Реакция | Max retries |
-|------|---------------------|---------|-------------|
-| RESEARCH | Web search timeout, API limit | Retry через 5 мин. 3 fails → skip research + notify | 3 |
-| BRAINSTORM | Spec пустой/бессмысленный | Reviewer reject → re-brainstorm. 2 fails → escalate | 2 |
-| DECOMPOSE | Spec слишком абстрактный | Назад в brainstorm с комментарием "нужна конкретика" | 1 |
-| DEVELOP | ACP сессия crash/timeout | Restart на том же branch. Corrupted → fresh branch | 2 |
-| DEVELOP | CI fails (lint, typecheck) | ACP получает CI output, фиксит, push. Max 3 fix-cycles | 3 |
-| DEVELOP | Merge conflict | Rebase. Trivial → auto. Complex → sequential merge | 2 |
-| TEST | Тесты fail | Bug issue → fix → re-test. Max 3 цикла | 3 |
-| REVIEW | Changes requested | Назад в dev с конкретными comments. Max 2 rounds | 2 |
-| DEPLOY | Docker build fail | Fix Dockerfile PR → re-deploy. Infra → notify human | 2 |
-| DEPLOY | Smoke test fail | Назад в test фазу с ошибкой | 1 |
-
-### 4.2 — Escalation chain
+**Scenario:** "Dashboard для мониторинга агентов" → delivery
 
 ```
-Retry (автоматически)
-    │ max retries exceeded
-    ▼
-Notify human в Telegram (ошибка + что пробовали)
-    │ 30 мин нет ответа
-    ▼
-Pipeline PAUSED (label: pipeline:blocked)
-    │ human вмешался
-    ▼
-Resume с текущей фазы
+1. Юра создаёт issue #42 "Agent Health Dashboard" → label `idea`
+2. Юра ставит `idea:approved` → Платон видит → `pipeline:research`
+3. Платон спавнит Brainstorm → web_search аналогов, tech stack
+4. Brainstorm: research.md → комментарий на #42 → `pipeline:research-done`
+5. Платон → `pipeline:brainstorm` → Brainstorm запускает brainstorming skill
+6. AI↔AI brainstorm: Brainstorm задаёт вопросы ← Платон отвечает
+7. spec.md → push в `sokrat-brainstorms` → `pipeline:spec-ready`
+8. Платон ревьюит spec → OK → `pipeline:spec-approved`
+9. Уведомление Юре → 30 мин → auto-continue → `pipeline:decompose`
+10. Architect: spec → 5 issues (#43-#47), milestone "Health Dashboard"
+11. `pipeline:issues-ready` → Ops запускает AO
+12. AO: #43 + #44 параллельно (нет зависимостей), #45 ждёт (#43 dependency)
+13. PRs, CI, unit тесты → merge
+14. `pipeline:test` → Ops спавнит E2E (Playwright)
+15. E2E pass → `pipeline:review`
+16. AI code review → approved → `pipeline:deploy`
+17. Ops: Docker build → staging → Cloudflare tunnel → URL
+18. Юре: "🏛️ Dashboard готов: [staging URL]. Ревью?"
+19. Юра: "ОК" → `pipeline:retro`
+20. Платон: retro.md, metrics, learnings
 ```
 
-### 4.3 — Timeout policy
-
-| Фаза | Max время | При timeout |
-|------|-----------|-------------|
-| Research | 30 мин | Skip + notify |
-| Brainstorm | 60 мин | Kill, retry once |
-| Decompose | 20 мин | Retry once |
-| Dev (per issue) | 120 мин | Kill, reassign |
-| Test | 60 мин | Kill, retry |
-| Review | 30 мин | Auto-approve ⚠️ |
-| Deploy | 15 мин | Kill, notify human |
-
-### 4.4 — Poison pill protection
-
-Если один проект в цикле retry → fail → retry больше 3 раз на одной фазе:
-- Pipeline останавливается для ЭТОГО проекта
-- Label `pipeline:poisoned`
-- Notification с полным логом
-- Другие проекты НЕ блокируются
-
-### 4.5 — State recovery
-
-Если Сократ перезапустился:
-1. Читает `pipeline-state.json`
-2. Проверяет GitHub labels (labels > local state при конфликте)
-3. Возобновляет мониторинг
+**Timeline estimate:** 2-4 часа (simple web app), 6-12 часов (complex product)
 
 ---
 
-## 5. Testing Strategy
+## 5. Error Handling
 
-### Три уровня
+### По фазам
 
-```
-┌─────────────────────────────────────────────┐
-│     Level 3: E2E / UI (QA Agent)            │
-│  Playwright: user flows, forms, navigation  │
-│  ПОСЛЕ merge всех issues                    │
-├─────────────────────────────────────────────┤
-│     Level 2: Integration (QA Agent)         │
-│  API, DB, service interactions              │
-│  ПОСЛЕ merge всех issues                    │
-├─────────────────────────────────────────────┤
-│     Level 1: Unit (Dev Agent, TDD)          │
-│  Functions, components, utils               │
-│  ВМЕСТЕ с кодом                             │
-└─────────────────────────────────────────────┘
-```
+| Фаза | Ошибка | Действие |
+|------|--------|----------|
+| Research | web_search timeout | Retry ×2, skip research |
+| Brainstorm | Agent unresponsive | Платон пинг, 5 мин timeout, restart session |
+| Decompose | Spec unclear | Architect пишет вопросы → Brainstorm → Платон |
+| Develop | ACP hang | Ops: `ao session kill`, re-spawn. Max 3 retries |
+| Develop | Merge conflict | AO спавнит ACP для resolve |
+| Test | Flaky test | Re-run ×2. Если consistently fails → fix issue |
+| Test | All tests fail | Stop pipeline, эскалация к человеку |
+| Deploy | Build fail | Ops: ci-forensics → fix → retry |
+| Deploy | Staging crash | Rollback, fix issue → retry |
 
-### Level 1: Unit (Dev)
-- TDD preferred
-- Каждая функция — happy path + edge case минимум
-- Framework: Vitest (frontend), Jest/pytest (backend)
-- CI gate: coverage ≥ 70%
+### Poison Pill Protection
 
-### Level 2: Integration (QA Agent)
-- API endpoints: request → response, status codes, validation
-- DB operations: CRUD, constraints, migrations
-- Service interactions: auth → API → DB flow
-- Framework: Supertest/httpx + testcontainers
+Если issue не может быть resolved после 3 ACP respawns:
+1. Label `pipeline:blocked`
+2. Comment с диагностикой
+3. Уведомление человеку: "⚠️ Issue #X заблокирован после 3 попыток: [причина]"
+4. Pipeline продолжает с другими issues (skip blocked)
 
-### Level 3: E2E (QA Agent + Playwright)
-- Critical user flows из spec
-- Формы: валидация, submit, errors
-- Навигация: все роуты + 404
-- Responsive: desktop (1280px) + mobile (375px)
-- Headless Chromium в CI
+### Recovery After Restart
 
-### По типу продукта
-
-| Тип | Unit | Integration | E2E |
-|-----|------|-------------|-----|
-| Web app | ✅ Vitest + Jest | ✅ API + DB | ✅ Playwright |
-| CLI tool | ✅ Unit | ✅ Command integration | ❌ |
-| OpenClaw skill | ✅ Unit | ✅ Skill mock | ❌ |
-
-### Agent Browser (fallback)
-- Primary: Playwright (детерминистичный, CI-native)
-- Fallback: Agent Browser — визуальная проверка по запросу человека
-- Скриншоты → Telegram
+Если Платон перезапустился:
+1. Читает GitHub labels → восстанавливает состояние pipeline
+2. Каждая фаза idempotent — можно перезапустить
+3. Labels = single source of truth → no lost state
 
 ---
 
-## 6. Scope
+## 6. Label State Machine
 
-### v1 (In Scope)
+```
+idea → idea:approved → pipeline:research → pipeline:research-done →
+pipeline:brainstorm → pipeline:spec-ready → pipeline:spec-approved →
+pipeline:decompose → pipeline:issues-ready → pipeline:develop →
+pipeline:test → pipeline:review → pipeline:review-pass →
+pipeline:deploy → pipeline:deploy-done → pipeline:retro → pipeline:complete
+```
 
-- ✅ Полный pipeline: idea → spec → issues → code → test → review → staging → retro
-- ✅ Web apps как primary target
-- ✅ GitHub Issues + Labels как state machine
-- ✅ Параллельная разработка (2-3 issues)
-- ✅ Unit + Integration + E2E тесты
-- ✅ AI code review
-- ✅ Auto-deploy на staging (Docker)
-- ✅ Формальная ретро + метрики
-- ✅ 30-мин auto-continue
-- ✅ Poison pill protection
-- ✅ Single VPS
+**Blocked states:** `pipeline:blocked`, `pipeline:human-needed`
 
-### v2+ (Out of Scope)
+**Каждый label = ровно один владелец:**
 
-- ❌ Multi-repo projects
-- ❌ Production auto-deploy
-- ❌ Visual regression testing
-- ❌ Performance/load testing
-- ❌ AI-генерация идей по cron
-- ❌ A/B testing / feature flags
-- ❌ Multi-VPS / cloud
-- ❌ Production мониторинг + auto-rollback
-- ❌ User feedback collection
-
-### Явные ограничения v1
-
-- Один проект в pipeline одновременно
-- Один VPS для staging
-- GitHub как единственный git provider
-- Docker-only деплой
-- Английские labels/branches, русская коммуникация
+| Label | Кто ставит | Кто реагирует |
+|-------|-----------|---------------|
+| `idea:approved` | Человек | Платон |
+| `pipeline:research` | Платон | Brainstorm |
+| `pipeline:research-done` | Brainstorm | Платон |
+| `pipeline:brainstorm` | Платон | Brainstorm |
+| `pipeline:spec-ready` | Brainstorm | Платон |
+| `pipeline:spec-approved` | Платон | Architect |
+| `pipeline:decompose` | Платон | Architect |
+| `pipeline:issues-ready` | Architect | Ops |
+| `pipeline:develop` | Ops | AO |
+| `pipeline:test` | Ops | Ops |
+| `pipeline:review` | Ops | Платон |
+| `pipeline:review-pass` | Платон | Ops |
+| `pipeline:deploy` | Платон/Ops | Ops |
+| `pipeline:deploy-done` | Ops | Платон |
+| `pipeline:retro` | Платон | Платон |
+| `pipeline:complete` | Платон | — |
 
 ---
 
-## 7. Label State Machine
+## 7. Testing Strategy — Detail
 
-Полная карта labels и переходов:
+### Unit Tests (Phase 5, inline)
+- **Кто:** ACP sessions (Codex/Claude Code)
+- **Когда:** Одновременно с кодом (TDD)
+- **Что:** Functions, utilities, API handlers
+- **Framework:** Vitest (Bun), Jest (Node)
+- **Coverage:** ≥70%
 
-```
-idea → idea:approved → pipeline:research → pipeline:research-done
-→ pipeline:brainstorm → pipeline:spec-ready → pipeline:spec-review
-→ pipeline:spec-approved → pipeline:decompose → pipeline:issues-ready
-→ pipeline:dev → pipeline:dev-done → pipeline:test → pipeline:tests-pass
-→ pipeline:review → pipeline:review-pass → pipeline:deploy
-→ pipeline:deployed → pipeline:retro → pipeline:done
-```
+### Integration Tests (Phase 6a)
+- **Кто:** ACP session, спавненная Ops
+- **Когда:** После merge всех PRs
+- **Что:** API endpoints, data flow, auth
+- **Framework:** Vitest/Jest + supertest
+- **Env:** Testcontainers для DB/Redis
 
-**Error labels:**
-- `pipeline:blocked` — ждёт human intervention
-- `pipeline:poisoned` — застрял, требует ручного разбора
-- `bug:auto` — баг найденный в testing
+### E2E / UI Tests (Phase 6b)
+- **Кто:** ACP session, спавненная Ops
+- **Когда:** После integration pass
+- **Что:** User flows, формы, навигация, кнопки
+- **Framework:** Playwright
+- **Скрипт:**
+  1. ACP читает spec → выделяет user flows
+  2. Пишет `tests/e2e/*.spec.ts`
+  3. Запускает `npx playwright test`
+  4. При failure: скриншот + trace → анализ → fix
 
-**Auxiliary labels:**
-- `priority:high`, `priority:med`, `priority:low`
-- `type:frontend`, `type:backend`, `type:infra`, `type:test`
-- `idea:ai-generated` (v2)
+### Visual Regression (Phase 6c, v2)
+- **Tool:** Playwright screenshots → diff
+- **Baseline:** первый успешный run = baseline
+- **Threshold:** 1% pixel diff
 
 ---
 
-## 8. Agent Responsibilities Summary
+## 8. Scope Boundaries
 
-| Агент | Роль в pipeline | Фазы |
-|-------|----------------|------|
-| **Сократ** | Event dispatcher, координатор, spec reviewer | Мониторинг всех фаз, Phase 4a |
-| **Аристотель** | Research, data collection | Phase 2 |
-| **Платон** | Brainstorm, spec generation | Phase 3 |
-| **Архимед** | Dev orchestrator, merge manager | Phase 5, bug fixes |
-| **QA Agent** | Integration + E2E тесты | Phase 6 |
-| **AI Reviewer** | Code review | Phase 7 |
-| **Deployer** | Docker build + staging deploy | Phase 8 |
-| **Геродот** | Retro report, metrics | Phase 9 |
+### In scope (v1)
+- [x] 9-phase pipeline с label state machine
+- [x] AI↔AI brainstorm (Brainstorm ↔ Платон)
+- [x] Automated spec → issues decomposition
+- [x] AO-driven parallel development
+- [x] 3-level testing (unit + integration + E2E)
+- [x] AI code review
+- [x] Staging auto-deploy
+- [x] Retro + metrics
 
-*QA Agent, AI Reviewer, Deployer — это не отдельные постоянные агенты, а ACP сессии спавнимые по требованию.*
+### Out of scope (v2+)
+- [ ] AI idea generation (auto-create issues)
+- [ ] Multi-project parallel pipelines
+- [ ] Production auto-deploy
+- [ ] Visual regression testing
+- [ ] Performance/load testing
+- [ ] A/B testing
+- [ ] User analytics integration
 
 ---
 
 ## 9. Implementation Priority
 
-Порядок реализации pipeline (инкрементальный):
+| # | Компонент | Критичность | Зависимости |
+|---|-----------|-------------|-------------|
+| 1 | **Label state machine** — GitHub labels + Платон monitor loop | Core | — |
+| 2 | **Phase 5: Dev** — AO + ACP sessions (core value) | Core | AO setup |
+| 3 | **Phase 4: Decompose** — Architect issue creation | Core | issue-architect skill |
+| 4 | **Phase 6: Test** — CI + E2E | Core | CI config |
+| 5 | **Phase 3: Brainstorm** — AI↔AI flow | High | brainstorming skill |
+| 6 | **Phase 2: Research** — Brainstorm web_search | Medium | web_search tool |
+| 7 | **Phase 7: Review** — AI code review | High | — |
+| 8 | **Phase 8: Deploy** — Staging automation | Medium | Docker, Cloudflare |
+| 9 | **Phase 9: Retro** — Metrics collection | Low | — |
+| 10 | **Phase 1: Ideate** — Backlog scoring | Low | — |
 
-1. **Label state machine** — GitHub labels + Сократ monitor loop
-2. **Phase 5: Dev** — Архимед + ACP сессии (core value)
-3. **Phase 6: Test** — QA agent + CI integration
-4. **Phase 4: Decompose** — spec → issues автоматизация
-5. **Phase 3: Brainstorm** — AI↔AI self-brainstorm
-6. **Phase 2: Research** — Аристотель automation
-7. **Phase 7: Review** — AI code review
-8. **Phase 8: Deploy** — Docker staging pipeline
-9. **Phase 9: Retro** — Metrics + feedback loop
-10. **Phase 1: Ideate** — Backlog management + scoring
+---
 
-*Логика: начинаем с dev core (Phases 4-6), потом расширяем в обе стороны.*
+## Changelog
+
+- 2026-03-16: Initial spec. Architecture: Платон + Brainstorm + Architect + Ops + AO. 9 phases, label state machine, AI↔AI brainstorm.
+- 2026-03-16: **Revised** — replaced Империя agents (Сократ/Архимед/Аристотель/Геродот) with Платон ecosystem agents. Research → Brainstorm (web_search). Dev orchestration → AO (Agent Orchestrator) via Ops. Aligned with actual Platon architecture.
